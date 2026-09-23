@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Touch Glass QC</title>
+<style>
+:root{--bg:#111;--fg:#eee;--mut:#999;--ok:#1db954;--bad:#e5484d;--acc:#3b82f6}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:20px system-ui,sans-serif}
+#home{max-width:900px;margin:0 auto;padding:24px 16px}
+h1{font-size:32px;margin:0 0 16px}
+select,input,button,.btn{font:inherit;padding:12px 16px;border-radius:10px;border:1px solid #444;background:#222;color:var(--fg)}
+button,.btn{cursor:pointer}
+.big{display:block;width:100%;font-size:44px;font-weight:800;padding:32px;background:var(--ok);color:#000;border:0;margin:16px 0}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.mut{color:var(--mut);font-size:16px}
+details{margin-top:24px;border-top:1px solid #333;padding-top:12px}
+summary{cursor:pointer;color:var(--mut)}
+#stage{position:fixed;inset:0;display:none;touch-action:none;user-select:none}
+#cv{position:absolute;inset:0;width:100%;height:100%}
+#bar{position:absolute;top:0;left:0;right:0;display:flex;gap:12px;align-items:center;padding:10px 16px;background:#000c;pointer-events:none}
+#msg{flex:1;font-size:26px;font-weight:600}
+#bar button{pointer-events:auto}
+#fail{background:var(--bad);color:#fff;border:0;font-weight:700}
+#result{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;padding:16px;background:#000d}
+#rtitle{font-size:min(180px,22vh);font-weight:900;margin:0;line-height:1}
+#rwhy{font-size:26px;text-align:left}
+</style>
+</head>
+<body>
+<div id="home">
+  <h1>Touch Glass QC</h1>
+  <div class="row"><select id="prof" style="flex:1"></select></div>
+  <button class="big" id="go">START TEST</button>
+  <button class="big" id="rgo" style="background:var(--acc);color:#fff;font-size:32px;padding:24px">RESISTANCE TEST (Arduino)</button>
+  <div class="row"><button id="drawonly">Draw only (no pass/fail)</button></div>
+
+  <details><summary>Add / remove glass profiles</summary>
+    <div class="row">
+      <input id="pn" placeholder="Make Model" style="flex:1;min-width:200px">
+      <input id="pw" type="number" step="0.01" min="0.1" placeholder='Width "' style="width:130px">
+      <input id="ph" type="number" step="0.01" min="0.1" placeholder='Height "' style="width:130px">
+      <button id="add">Add</button>
+    </div>
+    <p class="mut">Measure the ACTIVE touch area (inside the printed border), in inches.</p>
+    <div class="row">
+      <button id="del">Delete selected</button>
+      <button id="exp">Backup to file</button>
+      <label class="btn">Restore from file<input id="imp" type="file" accept=".json" hidden></label>
+    </div>
+  </details>
+
+  <details><summary>Settings (supervisor)</summary>
+    <p>Hold a credit card flat on the screen. Drag the slider until the blue bar is exactly as wide as the card.</p>
+    <div id="card" style="height:40px;background:var(--acc)"></div>
+    <div class="row"><input id="ppi" type="range" min="40" max="400" step="0.25" style="flex:1"><span id="ppiv"></span></div>
+    <div class="row">Accuracy limit % <input id="tol" type="number" step="0.1" style="width:100px">
+      Jitter limit mm <input id="jit" type="number" step="0.1" style="width:100px"></div>
+    <div class="row">Arduino: max ohms <input id="rmax" type="number" step="100" style="width:120px">
+      max spread × <input id="rratio" type="number" step="0.1" style="width:100px">
+      max skips <input id="rskips" type="number" step="1" min="0" style="width:90px"></div>
+    <p class="mut">Keep browser zoom at 100% (Ctrl+0) or sizes will be wrong.</p>
+  </details>
+</div>
+
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="bar"><div id="msg"></div><button id="clear">Clear</button><button id="fail">✗ FAIL — not working</button><button id="quit">Home</button></div>
+  <div id="result">
+    <p id="rtitle"></p>
+    <ul id="rwhy"></ul>
+    <p id="rdata" class="mut" style="font-family:monospace"></p>
+    <div class="row"><button class="big" id="next" style="width:auto">NEXT GLASS</button><button id="rhome">Home</button></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} };
+// ponytail: thresholds are knobs, tune them on known-good glass before trusting FAILs
+let S = Object.assign({ ppi: 96, tolPct: 2, jitterMm: 1.5, jumpIn: 0.6, maxJumps: 3, rpu: 35000, rMaxOhm: 3000, rMaxRatio: 2, rMaxSkips: 0, rSpike: 20000 }, load('qc.settings', {}));
+let P = load('qc.profiles', []);
+
+// ---------- math ----------
+const mean = pts => [pts.reduce((a, p) => a + p[0], 0) / pts.length, pts.reduce((a, p) => a + p[1], 0) / pts.length];
+const det3 = m => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+const solve3 = (A, b) => { const D = det3(A); return [0, 1, 2].map(k => det3(A.map((r, i) => r.map((v, j) => j === k ? b[i] : v))) / D); };
+// Least-squares affine map raw->true. Absorbs rotation/mirroring, so cable direction doesn't matter.
+function fit(raw, tru) {
+  const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], bx = [0, 0, 0], by = [0, 0, 0];
+  raw.forEach(([x, y], n) => { const v = [x, y, 1]; for (let r = 0; r < 3; r++) { for (let c = 0; c < 3; c++) M[r][c] += v[r] * v[c]; bx[r] += v[r] * tru[n][0]; by[r] += v[r] * tru[n][1]; } });
+  const cx = solve3(M, bx), cy = solve3(M, by);
+  return ([x, y]) => [cx[0] * x + cx[1] * y + cx[2], cy[0] * x + cy[1] * y + cy[2]];
+}
+(() => { const f = ([x, y]) => [-2 * x + .1 * y + 5, -y + 300], raw = [[0, 0], [100, 0], [100, 50], [0, 50]], m = fit(raw, raw.map(f)), p = m([37, 11]), q = f([37, 11]);
+  console.assert(Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-6, 'fit() self-check failed'); })();
+
+// ---------- home ----------
+function renderHome() {
+  const sel = $('#prof'); sel.innerHTML = '';
+  P.forEach((p, n) => sel.add(new Option(`${p.name}   (${p.w}" × ${p.h}")`, n)));
+  if (!P.length) sel.add(new Option('No glass profiles yet: add one below', ''));
+  sel.value = Math.min(load('qc.last', 0), P.length - 1);
+  $('#ppi').value = S.ppi; $('#ppiv').textContent = S.ppi + ' px/in';
+  $('#card').style.width = 3.370 * S.ppi + 'px'; // ISO credit card width
+  for (const [id, k] of NUMS) $(id).value = S[k];
+}
+$('#prof').onchange = e => save('qc.last', +e.target.value);
+$('#add').onclick = () => {
+  const name = $('#pn').value.trim(), w = +$('#pw').value, h = +$('#ph').value;
+  if (!name || !(w > 0) || !(h > 0)) return alert('Fill in name, width and height.');
+  if (w * S.ppi > screen.width || h * S.ppi > screen.height) alert('Warning: that glass is bigger than this screen.');
+  P.push({ name, w, h }); save('qc.profiles', P); save('qc.last', P.length - 1);
+  $('#pn').value = $('#pw').value = $('#ph').value = ''; renderHome();
+};
+$('#del').onclick = () => { const n = $('#prof').value; if (n === '' || !confirm(`Delete "${P[n].name}"?`)) return; P.splice(n, 1); save('qc.profiles', P); renderHome(); };
+$('#exp').onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify({ P, S }, null, 1)], { type: 'application/json' })); a.download = 'touch-qc-backup.json'; a.click(); };
+$('#imp').onchange = async e => {
+  try {
+    const d = JSON.parse(await e.target.files[0].text());
+    P = (d.P || []).filter(p => p && typeof p.name === 'string' && p.w > 0 && p.h > 0).map(({ name, w, h }) => ({ name, w: +w, h: +h }));
+    if (d.S) S = Object.assign(S, d.S);
+    save('qc.profiles', P); save('qc.settings', S); renderHome();
+  } catch { alert('That is not a valid backup file.'); }
+  e.target.value = '';
+};
+$('#ppi').oninput = e => { S.ppi = +e.target.value; save('qc.settings', S); renderHome(); };
+var NUMS = [['#tol', 'tolPct'], ['#jit', 'jitterMm'], ['#rmax', 'rMaxOhm'], ['#rratio', 'rMaxRatio'], ['#rskips', 'rMaxSkips']];
+for (const [id, k] of NUMS) $(id).onchange = e => { S[k] = +e.target.value; save('qc.settings', S); };
+
+// ---------- test ----------
+const CAL = [[.12, .12], [.88, .12], [.88, .88], [.12, .88]];
+const VER = [[.5, .5], [.5, .12], [.88, .5], [.5, .88], [.12, .5]];
+const HOLD_MS = 800, SETTLE_MS = 150;
+let phase = 'home', mode = 'touch', free, prof, G, i, raw, map, R, hold, waitUp, dropsHere, strokes, cells, cols, rows, last;
+const glassRect = () => { const w = prof.w * S.ppi, h = prof.h * S.ppi; return { x: (innerWidth - w) / 2, y: (innerHeight - h) / 2, w, h }; };
+const toPx = ([fx, fy]) => [G.x + fx * G.w, G.y + fy * G.h];
+
+async function start(isFree) {
+  prof = P[$('#prof').value]; if (!prof) return alert('Pick or add a glass profile first.');
+  free = isFree; mode = 'touch';
+  $('#home').style.display = 'none'; $('#stage').style.display = 'block';
+  try { await document.documentElement.requestFullscreen(); } catch {}
+  setPhase('place');
+}
+function goHome() {
+  phase = 'home';
+  if (document.fullscreenElement) document.exitFullscreen();
+  $('#stage').style.display = 'none'; $('#home').style.display = 'block'; renderHome();
+}
+document.onfullscreenchange = () => { if (!document.fullscreenElement && phase !== 'home') goHome(); };
+
+function setPhase(p) {
+  phase = p; i = 0; hold = null; dropsHere = 0;
+  if (p === 'place' || p === 'a_check') { A = { spots: [], maxDrops: 0, live: Infinity, why: '' }; D = { rs: [], skips: 0, spikes: 0 }; raw = []; R = { err: [], jit: [], maxDrops: 0, jumps: [] }; strokes = []; cells = new Set(); cols = rows = 0; }
+  if (p === 'grid') { strokes = []; last = null; if (!free) { cols = Math.max(3, Math.round(prof.w / .5)); rows = Math.max(3, Math.round(prof.h / .5)); } }
+  $('#result').style.display = p === 'result' ? 'flex' : 'none';
+  $('#clear').style.display = p === 'grid' && free ? '' : 'none';
+  $('#fail').style.display = free || p === 'place' || p === 'result' ? 'none' : '';
+  if (p === 'a_check') aT0 = performance.now();
+  prompt();
+}
+function prompt() {
+  $('#msg').textContent = {
+    place: 'Lay the glass inside the white box and plug it in. Then tap the glass.',
+    cal: `Press and HOLD the + until it turns green.   (${i + 1} of ${CAL.length})`,
+    verify: `Checking accuracy: press and HOLD the +.   (${i + 1} of ${VER.length})`,
+    grid: free ? 'Draw on the glass.' : 'Rub your finger over the WHOLE glass until every square is green.',
+    a_check: 'Lay the glass in the white box and plug its cable into the TESTER. Hands off the glass.' +
+      (A?.why && performance.now() - aT0 > 4000 ? `   ⚠ ${A.why}. Check the cable. Still stuck? Press FAIL.` : ''),
+    a_spots: `Put the stylus on the + and let go. Wait for the beep.   (${i + 1} of ${VER.length})`,
+    a_drag: 'Slide the stylus SLOWLY along the arrow, left to right (about 3 seconds). Then lift it.' + (D?.short ? '   Too fast, do it again.' : ''),
+  }[phase] ?? '';
+}
+
+function accept() {
+  let s = hold.s.filter(([t]) => t - hold.t0 >= SETTLE_MS); if (!s.length) s = hold.s;
+  const pts = s.map(([, x, y]) => [x, y]);
+  hold = null; waitUp = true; beep(880);
+  R.maxDrops = Math.max(R.maxDrops, dropsHere); dropsHere = 0;
+  if (phase === 'cal') {
+    raw.push(mean(pts));
+    if (++i === CAL.length) { map = fit(raw, CAL.map(toPx)); return setPhase(free ? 'grid' : 'verify'); }
+  } else {
+    const m = pts.map(map), c = mean(m), [tx, ty] = toPx(VER[i]);
+    R.err.push(Math.max(Math.abs(c[0] - tx) / G.w, Math.abs(c[1] - ty) / G.h) * 100);
+    R.jit.push(Math.max(...m.map(p => Math.hypot(p[0] - c[0], p[1] - c[1]))) * 25.4 / S.ppi);
+    if (++i === VER.length) return setPhase('grid');
+  }
+  prompt();
+}
+
+function paint(e) {
+  if (!strokes.length) strokes.push([]); // finger still down from the last accuracy spot
+  const evs = e.getCoalescedEvents?.();
+  for (const c of evs?.length ? evs : [e]) {
+    const p = map([c.clientX, c.clientY]);
+    if (last && Math.hypot(p[0] - last[0], p[1] - last[1]) > S.jumpIn * S.ppi) { R.jumps.push(p); strokes.push([]); }
+    strokes.at(-1).push(p); last = p;
+    const edge = .15 * S.ppi; // ponytail: touches just past the edge count, so edge squares are reachable
+    if (cols && p[0] > G.x - edge && p[0] < G.x + G.w + edge && p[1] > G.y - edge && p[1] < G.y + G.h + edge) {
+      const cl = (v, n) => Math.min(n - 1, Math.max(0, Math.floor(v * n)));
+      cells.add(cl((p[0] - G.x) / G.w, cols) + ',' + cl((p[1] - G.y) / G.h, rows));
+    }
+  }
+  if (cols && cells.size === cols * rows) finish(false);
+}
+
+function finish(manual) {
+  const why = [];
+  R.err.forEach((e, k) => e > S.tolPct && why.push(`Spot ${k + 1} is off by ${e.toFixed(1)}% (limit ${S.tolPct}%): bad accuracy`));
+  R.jit.forEach((j, k) => j > S.jitterMm && why.push(`Spot ${k + 1} jitters ${j.toFixed(1)} mm (limit ${S.jitterMm} mm): noisy`));
+  if (R.maxDrops >= 3) why.push(`Touch kept cutting out (${R.maxDrops}× on one spot): weak / insensitive`);
+  if (R.jumps.length >= S.maxJumps) why.push(`${R.jumps.length} jumps while dragging: glitchy`);
+  if (cols && cells.size < cols * rows) why.push(`${cols * rows - cells.size} square(s) never lit up: dead spots`);
+  let data = '';
+  if (mode === 'arduino') {
+    A.spots.forEach((r, k) => r > S.rMaxOhm && why.push(`Spot ${k + 1} reads ${fmtOhm(r)} (limit ${fmtOhm(S.rMaxOhm)}): poor contact`));
+    const ratio = Math.max(...A.spots) / Math.min(...A.spots);
+    if (A.spots.length > 1 && ratio > S.rMaxRatio) why.push(`Spots differ ${ratio.toFixed(1)}× (limit ${S.rMaxRatio}×): uneven coating`);
+    if (A.maxDrops >= 3) why.push(`Contact kept cutting out (${A.maxDrops}× on one spot): weak spot`);
+    if (D.skips > S.rMaxSkips) why.push(`${D.skips} skip(s) while sliding (limit ${S.rMaxSkips}): contact breaks`);
+    if (phase === 'a_check' && A.why) why.push(A.why);
+    data = `Spots: ${A.spots.map(fmtOhm).join('  ') || '-'}   ·   Slide: ${D.skips} skips, ${D.spikes} light-contact samples, typical ${D.rs.length ? fmtOhm(median(D.rs)) : '-'}`;
+  } else if (R.err.length) {
+    data = `Accuracy %: ${R.err.map(e => e.toFixed(1)).join('  ')}   ·   Jitter mm: ${R.jit.map(j => j.toFixed(1)).join('  ')}   ·   Jumps: ${R.jumps.length}`;
+  }
+  if (manual && !why.length) why.push('Marked FAIL by operator');
+  setPhase('result');
+  $('#rdata').textContent = data;
+  $('#rtitle').textContent = why.length ? 'FAIL' : 'PASS';
+  $('#rtitle').style.color = why.length ? 'var(--bad)' : 'var(--ok)';
+  $('#rwhy').replaceChildren(...why.map(w => Object.assign(document.createElement('li'), { textContent: w })));
+  beep(why.length ? 220 : 1320, .4);
+}
+
+const cv = $('#cv');
+cv.oncontextmenu = e => e.preventDefault(); // Windows press-and-hold = right click
+cv.onpointerdown = e => {
+  cv.setPointerCapture(e.pointerId);
+  if ((phase === 'cal' || phase === 'verify') && !waitUp) hold = { t0: e.timeStamp, s: [[e.timeStamp, e.clientX, e.clientY]] };
+  if (phase === 'grid') { last = null; strokes.push([]); paint(e); }
+};
+cv.onpointermove = e => {
+  if (hold) { const evs = e.getCoalescedEvents?.(); for (const c of evs?.length ? evs : [e]) hold.s.push([c.timeStamp, c.clientX, c.clientY]); }
+  else if (phase === 'grid' && e.buttons) paint(e);
+};
+cv.onpointerup = cv.onpointercancel = () => {
+  if (hold) { hold = null; dropsHere++; }
+  waitUp = false;
+  if (phase === 'place') { G = glassRect(); setPhase('cal'); }
+};
+
+function draw(now) {
+  requestAnimationFrame(draw);
+  if (phase === 'home') return;
+  if (phase === 'place' || phase === 'a_check') G = glassRect();
+  if (hold && (phase === 'cal' || phase === 'verify') && now - hold.t0 >= HOLD_MS) accept();
+  const d = devicePixelRatio, x = cv.getContext('2d');
+  if (cv.width !== innerWidth * d || cv.height !== innerHeight * d) { cv.width = innerWidth * d; cv.height = innerHeight * d; }
+  x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, innerWidth, innerHeight);
+  if (cols) {
+    const cw = G.w / cols, ch = G.h / rows;
+    x.fillStyle = '#1db95488';
+    for (const k of cells) { const [a, b] = k.split(','); x.fillRect(G.x + a * cw, G.y + b * ch, cw, ch); }
+    x.strokeStyle = '#444'; x.lineWidth = 1; x.beginPath();
+    for (let c = 1; c < cols; c++) { x.moveTo(G.x + c * cw, G.y); x.lineTo(G.x + c * cw, G.y + G.h); }
+    for (let r = 1; r < rows; r++) { x.moveTo(G.x, G.y + r * ch); x.lineTo(G.x + G.w, G.y + r * ch); }
+    x.stroke();
+  }
+  const placing = phase === 'place' || phase === 'a_check';
+  x.setLineDash(placing ? [14, 8] : []); x.strokeStyle = placing ? '#fff' : '#777'; x.lineWidth = 3;
+  x.strokeRect(G.x, G.y, G.w, G.h); x.setLineDash([]);
+  if (phase === 'cal' || phase === 'verify' || phase === 'a_spots') {
+    const [tx, ty] = toPx((phase === 'cal' ? CAL : VER)[i]), hm = phase === 'a_spots' ? A_HOLD : HOLD_MS;
+    if (hold) { x.fillStyle = '#1db954'; x.beginPath(); x.moveTo(tx, ty); x.arc(tx, ty, 18, -Math.PI / 2, -Math.PI / 2 + Math.min(1, (now - hold.t0) / hm) * 2 * Math.PI); x.fill(); }
+    x.strokeStyle = '#fff'; x.lineWidth = 2; x.beginPath();
+    x.moveTo(tx - 30, ty); x.lineTo(tx + 30, ty); x.moveTo(tx, ty - 30); x.lineTo(tx, ty + 30);
+    x.moveTo(tx + 18, ty); x.arc(tx, ty, 18, 0, 2 * Math.PI); x.stroke();
+  }
+  x.strokeStyle = '#fff'; x.lineWidth = 3; x.lineJoin = x.lineCap = 'round';
+  for (const s of strokes) { x.beginPath(); s.forEach(([a, b], n) => n ? x.lineTo(a, b) : x.moveTo(a, b)); if (s.length === 1) x.lineTo(s[0][0] + .1, s[0][1]); x.stroke(); }
+  if (phase === 'a_drag') {
+    const y = G.y + G.h / 2, x0 = G.x + G.w * .08, x1 = G.x + G.w * .92;
+    x.strokeStyle = '#3b82f6'; x.lineWidth = 6; x.beginPath(); x.moveTo(x0, y); x.lineTo(x1, y);
+    x.moveTo(x1 - 20, y - 14); x.lineTo(x1, y); x.lineTo(x1 - 20, y + 14); x.stroke();
+  }
+  if (mode === 'arduino' && phase.startsWith('a_')) {
+    x.fillStyle = A.live < Infinity ? '#1db954' : '#999'; x.font = '600 28px system-ui'; x.textAlign = 'center';
+    x.fillText(A.live < Infinity ? `contact ${fmtOhm(A.live)}` : 'no contact', innerWidth / 2, innerHeight - 24);
+  }
+  x.fillStyle = '#e5484d';
+  for (const [a, b] of R.jumps) { x.beginPath(); x.arc(a, b, 8, 0, 2 * Math.PI); x.fill(); }
+}
+
+// ---------- Arduino resistance test (probe/probe.ino, glass on A0..A4) ----------
+// Protocol: send 5 pin states (H/L/U/Z) + newline, get 5 ADC readings back.
+const A_HOLD = 1500, CONNECTED = 300, OPEN = 1000;
+let A, D, W, aT0, aRun = 0, port, writer, lines = [], wake, lost;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const median = a => [...a].sort((p, q) => p - q)[a.length >> 1];
+const fmtOhm = r => r >= 1000 ? (r / 1000).toFixed(1) + 'kΩ' : r.toFixed(0) + 'Ω';
+const ohm = v => v >= OPEN ? Infinity : S.rpu * v / (1023 - v);  // ponytail: internal pullup (20-50k) as reference, add a real 1k resistor for true ohms
+
+async function connect() {
+  if (port && !lost) return;
+  if (!('serial' in navigator)) throw new Error('Open this page in Chrome or Edge.');
+  port = (await navigator.serial.getPorts())[0] || await navigator.serial.requestPort();
+  if (!port.readable) await port.open({ baudRate: 115200 });
+  lost = false; writer = port.writable.getWriter();
+  pump(port.readable.pipeThrough(new TextDecoderStream()).getReader());
+  await sleep(2200); // the Nano reboots when the port opens
+}
+async function pump(r) {
+  let b = '';
+  try { for (;;) { const { value, done } = await r.read(); if (done) break; b += value; let k;
+    while ((k = b.indexOf('\n')) >= 0) { lines.push(b.slice(0, k).trim()); b = b.slice(k + 1); wake?.(); } } } catch {}
+  lost = true; port = null; wake?.();
+}
+async function q(cfg) {
+  lines.length = 0; await writer.write(new TextEncoder().encode(cfg + '\n'));
+  const t0 = performance.now();
+  for (;;) {
+    while (lines.length) { const v = lines.shift().split(/\s+/).map(Number); if (v.length === 5 && v.every(n => n >= 0 && n <= 1023)) return v; }
+    if (lost || performance.now() - t0 > 1000) throw new Error('The tester is not answering. Check its USB cable.');
+    await new Promise(r => { wake = r; setTimeout(r, 50); });
+  }
+}
+// Untouched glass: the 4 corners are joined through the bottom sheet, the wiper is open to everything.
+async function scan() {
+  const link = [0, 1, 2, 3, 4].map(() => new Set());
+  for (let a = 0; a < 5; a++) for (let b = a + 1; b < 5; b++) {
+    const c = [...'ZZZZZ']; c[a] = 'U'; c[b] = 'L';
+    if ((await q(c.join('')))[a] < CONNECTED) { link[a].add(b); link[b].add(a); }
+  }
+  const iso = link.flatMap((s, k) => s.size ? [] : [k]);
+  if (iso.length === 1 && link.every((s, k) => k === iso[0] || s.size === 3)) return { wiper: iso[0] };
+  if (iso.length === 5) return { why: 'The tester sees no glass' };
+  if (!iso.length) return { why: 'Top and bottom layers are touching with nobody pressing: shorted' };
+  return { why: `${iso.length - 1} wire(s) not connected: bad cable or broken glass trace` };
+}
+
+async function aStart() {
+  prof = P[$('#prof').value]; if (!prof) return alert('Pick or add a glass profile first.');
+  try { await connect(); } catch (e) { return alert(e.message || 'No tester picked.'); }
+  mode = 'arduino'; free = false;
+  $('#home').style.display = 'none'; $('#stage').style.display = 'block';
+  try { await document.documentElement.requestFullscreen(); } catch {}
+  setPhase('a_check'); aLoop();
+}
+async function aLoop() {
+  const me = ++aRun;
+  try {
+    while (me === aRun && phase.startsWith('a_')) {
+      if (phase === 'a_check') {
+        const j = await scan();
+        if (j.wiper !== undefined) { W = j.wiper; G = glassRect(); setPhase('a_spots'); } else { A.why = j.why; prompt(); }
+        continue;
+      }
+      const cfg = [0, 1, 2, 3, 4].map(k => k === W ? 'U' : 'L').join('');
+      aSample(ohm((await q(cfg))[W]), performance.now());
+    }
+  } catch (e) { if (phase.startsWith('a_')) { alert(e.message); goHome(); } }
+}
+function aSample(r, now) {
+  A.live = r;
+  const touched = r < Infinity;
+  if (phase === 'a_spots') {
+    if (!touched) { if (hold) dropsHere++; hold = null; waitUp = false; return; }
+    if (waitUp) return;
+    hold ??= { t0: now, rs: [] }; hold.rs.push([now, r]);
+    if (now - hold.t0 < A_HOLD) return;
+    A.spots.push(median(hold.rs.filter(([t]) => now - t <= 1000).map(p => p[1])));
+    A.maxDrops = Math.max(A.maxDrops, dropsHere); dropsHere = 0;
+    hold = null; waitUp = true; beep(880);
+    if (++i === VER.length) { setPhase('a_drag'); waitUp = true; } else prompt();
+  } else if (phase === 'a_drag') {
+    if (waitUp) { if (!touched) waitUp = false; return; }  // stylus still on the last spot
+    if (touched) {
+      D.t0 ??= now; if (D.gap0) { D.skips++; D.gap0 = 0; }
+      D.rs.push(r); if (r > S.rSpike) D.spikes++;
+    } else if (D.t0 && !D.gap0) D.gap0 = now;
+    if (D.gap0 && now - D.gap0 > 700) {  // lifted for good
+      if (D.gap0 - D.t0 < 1500) { D = { rs: [], skips: 0, spikes: 0, short: true }; prompt(); } else finish(false);
+    }
+  }
+}
+
+let ac;
+function beep(f, dur = .08) {
+  try { ac ??= new AudioContext(); const o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = f; g.gain.value = .1;
+    o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + dur); } catch {}
+}
+
+$('#go').onclick = () => start(false);
+$('#drawonly').onclick = () => start(true);
+$('#quit').onclick = $('#rhome').onclick = goHome;
+$('#fail').onclick = () => finish(true);
+$('#clear').onclick = () => { strokes = []; R.jumps = []; };
+$('#next').onclick = () => mode === 'arduino' ? (setPhase('a_check'), aLoop()) : setPhase('place');
+$('#rgo').onclick = aStart;
+renderHome();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
