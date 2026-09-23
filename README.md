@@ -20,6 +20,8 @@ Only one controller can be connected to a glass at a time. Both drive the same w
 
 ## One-time setup
 
+![Profiles and supervisor settings](docs/settings.png)
+
 1. **Monitor:** open *Settings*, hold a credit card on the screen, and drag the slider until the blue bar matches the card. Keep browser zoom at 100%.
 2. **Profiles:** *Add / remove glass profiles* → name + **active area** width × height in inches. *Backup to file* saves them. Profiles live in the browser.
 3. **Touch controller:** Windows 10/11 sees the eGalax as a standard touchscreen, so no driver is needed. If the eGalax driver is installed, leave its calibration at the defaults, because its correction can hide glass faults. With several monitors, map touch to the flat one: *Tablet PC Settings → Setup*.
