@@ -2,6 +2,10 @@
 
 QC station for 5-wire resistive touch glass. A monitor lies flat and the glass goes on top of it. The screen draws the glass at its true size and walks the operator through the test, step by step, ending in a big **PASS** or **FAIL** with plain-English reasons.
 
+| Home | Place the glass | Resistance test |
+|---|---|---|
+| ![Home screen](docs/home.png) | ![Glass outline drawn at true size](docs/place-glass.png) | ![Stylus target with live contact readout](docs/resistance-spot.png) |
+
 Everything is in one page, `touch-qc.html`. Double-click **`Touch QC.bat`** to open it as its own window (Edge). Chrome works too.
 
 ## Two tests
